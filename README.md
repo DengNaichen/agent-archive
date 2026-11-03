@@ -15,6 +15,23 @@ make check
 make install
 ```
 
+## Help and output
+
+Run `agent-archive help` or `agent-archive help sync`. `-h` / `--help` also work on
+every command. With no arguments, the CLI shows help and exits successfully.
+
+The default interface is human-readable: results go to stdout and progress/errors
+to stderr. Add `--json` for scripts; successful results and progress then use
+newline-delimited JSON on stdout, while errors are JSON on stderr. This replaces
+the initial JSON-only default; scripts should now explicitly pass `--json`.
+
+```sh
+./bin/agent-archive status --snapshot ./codex-backup --json
+```
+
+Exit codes: 0 success/help, 1 operation failure, 2 invalid usage, 130 interrupted.
+Help commands never read snapshots or connect to ClickHouse.
+
 ## Collect private snapshots
 
 ```sh
@@ -26,7 +43,7 @@ Defaults: current `CODEX_HOME` or `~/.codex`, and `~/.claude`. Override with
 `--home /path/to/source-home`. Each output must be a new directory outside the
 source home. Collection preserves raw source snapshots, complete event JSON,
 source positions and session/child relationships, then verifies them. Check the
-final `verified:true`, `summary.json` and `verification.json`. Live-source changes
+final verification message, `summary.json` and `verification.json`. Live-source changes
 and malformed records are reported; original sources stay untouched.
 
 Codex reads `sessions` / `archived_sessions` JSONL and JSONL.ZST. Claude reads
@@ -37,13 +54,14 @@ not fetched. Existing truncation or deleted history cannot be recovered.
 
 ## Inspect and verify locally
 
-Global flags come **before** the command. There are no machine-specific default
-snapshot/config paths:
+Use `--snapshot` with a snapshot directory or a `cleaned.sqlite` file. Shared
+options work before or after the command; old `--local-db` / `--db` aliases remain
+accepted. There are no machine-specific default snapshot/config paths:
 
 ```sh
-./bin/agent-archive --local-db /path/to/snapshot/cleaned.sqlite status
-./bin/agent-archive --local-db /path/to/snapshot/cleaned.sqlite plan --all
-./bin/agent-archive --local-db /path/to/snapshot/cleaned.sqlite verify-local
+./bin/agent-archive status --snapshot /path/to/snapshot
+./bin/agent-archive plan --snapshot /path/to/snapshot --all
+./bin/agent-archive verify-local --snapshot /path/to/snapshot
 ```
 
 `status`, `plan`, `collect` and `verify-local` never connect to the cloud. Plan bytes
@@ -60,10 +78,10 @@ restrict it to mode 600. You may keep `password` empty and set
 in this project, passed as CLI arguments, or printed in errors.
 
 ```sh
-./bin/agent-archive --config /private/connection.local.json ping
-./bin/agent-archive --config /private/connection.local.json init
-./bin/agent-archive --local-db /path/to/cleaned.sqlite --config /private/connection.local.json sync --session SESSION_ID
-./bin/agent-archive --local-db /path/to/cleaned.sqlite --config /private/connection.local.json verify --session SESSION_ID
+./bin/agent-archive ping --config /private/connection.local.json
+./bin/agent-archive init --config /private/connection.local.json
+./bin/agent-archive sync --snapshot /path/to/snapshot --config /private/connection.local.json --session SESSION_ID
+./bin/agent-archive verify --snapshot /path/to/snapshot --config /private/connection.local.json --session SESSION_ID
 ```
 
 `ping` and `verify` are read-only. `init` creates missing tables/views without

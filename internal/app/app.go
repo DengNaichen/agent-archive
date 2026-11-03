@@ -1,97 +1,153 @@
-// Package app maps CLI requests to history and cloud operations; it does not
-// interpret source formats or implement storage/network protocols.
+// Package app owns the CLI workflow and its human/machine presentation.
+// Source interpretation, SQLite and ClickHouse protocols remain in their modules.
 package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
 	"github.com/DengNaichen/agent-archive/internal/cloud"
 	"github.com/DengNaichen/agent-archive/internal/fault"
 	"github.com/DengNaichen/agent-archive/internal/history"
-	"io"
-	"os"
-	"path/filepath"
-	"time"
 )
 
-const Version = "0.1.0-dev"
+const Version = "0.2.0-dev"
+const defaultBatchRows = 500
+const defaultBatchBytes = 4 << 20
+const defaultDelaySeconds = 2.0
 
 type stringsFlag []string
 
 func (s *stringsFlag) String() string     { return fmt.Sprint([]string(*s)) }
 func (s *stringsFlag) Set(v string) error { *s = append(*s, v); return nil }
 func Run(ctx context.Context, args []string, out, stderr io.Writer) (err error) {
-	root := flag.NewFlagSet("agent-archive", flag.ContinueOnError)
-	root.SetOutput(stderr)
 	var db, config string
-	root.StringVar(&db, "local-db", "", "snapshot cleaned.sqlite path")
-	root.StringVar(&db, "db", "", "snapshot cleaned.sqlite path")
-	root.StringVar(&config, "config", "", "private ClickHouse connection JSON")
-	root.Usage = func() {
-		fmt.Fprintln(stderr, "agent-archive [--local-db PATH] [--config PATH] <command> [options]\ncommands: collect, status, plan, verify-local, ping, init, sync, verify, version\ncollect --source codex|claude-code --output NEW_DIR [--home SOURCE_HOME]\nplan/sync/verify require --all or repeatable --session ID\nlocal commands never contact the cloud; sync performs actual uploads")
+	jsonMode, version := false, false
+	command := ""
+	defer func() {
+		if err != nil {
+			err = &commandError{err: err, json: jsonMode, command: command}
+		}
+	}()
+	shared := func(f *flag.FlagSet) {
+		f.StringVar(&db, "snapshot", db, "snapshot directory or database")
+		f.StringVar(&db, "local-db", db, "alias for --snapshot")
+		f.StringVar(&db, "db", db, "alias for --snapshot")
+		f.StringVar(&config, "config", config, "private ClickHouse connection JSON")
+		f.BoolVar(&jsonMode, "json", jsonMode, "newline-delimited JSON output")
+		f.BoolVar(&version, "version", version, "print version")
 	}
+	root := flag.NewFlagSet("agent-archive", flag.ContinueOnError)
+	root.SetOutput(io.Discard)
+	shared(root)
 	if e := root.Parse(args); e != nil {
 		if errors.Is(e, flag.ErrHelp) {
-			return nil
+			return help(out, "")
 		}
-		return e
+		return parseError(e, "")
 	}
 	rest := root.Args()
+	if version {
+		return (&presenter{out: out, json: jsonMode}).emit(map[string]any{"version": Version})
+	}
 	if len(rest) == 0 {
-		root.Usage()
-		return fault.New("a command is required")
+		return help(out, "")
 	}
-	command := rest[0]
-	emit := func(v any) error {
-		if e := json.NewEncoder(out).Encode(v); e != nil {
-			return fmt.Errorf("write output: %w", e)
+	command = rest[0]
+	if command == "help" {
+		if len(rest) > 2 {
+			return usage("help accepts one command name", "Use 'agent-archive help' or 'agent-archive help sync'.")
 		}
-		return nil
+		topic := ""
+		if len(rest) == 2 {
+			topic = rest[1]
+		}
+		return help(out, topic)
 	}
-	if command == "version" {
-		return emit(map[string]any{"version": Version})
+	if _, ok := spec(command); !ok {
+		message := "unknown command"
+		for _, c := range commands {
+			if distance(command, c.name) <= 2 {
+				message += "; did you mean '" + c.name + "'?"
+				break
+			}
+		}
+		return usage(message, "Run 'agent-archive help' to see available commands.")
 	}
+	hint := "Run 'agent-archive help " + command + "' for usage and examples."
 	f := flag.NewFlagSet(command, flag.ContinueOnError)
-	f.SetOutput(stderr)
+	f.SetOutput(io.Discard)
+	shared(f)
 	var ids stringsFlag
 	var all bool
-	batchRows, batchBytes, delay := 500, 4<<20, 2.0
 	var source, home, output string
-	switch command {
-	case "collect":
+	batchRows, batchBytes, delay := defaultBatchRows, defaultBatchBytes, defaultDelaySeconds
+	if command == "collect" {
 		f.StringVar(&source, "source", "", "codex or claude-code")
-		f.StringVar(&home, "home", "", "source home directory")
-		f.StringVar(&output, "output", "", "new private snapshot directory")
-	case "plan", "sync", "verify":
-		f.BoolVar(&all, "all", false, "select all sessions")
+		f.StringVar(&home, "home", "", "override source home directory")
+		f.StringVar(&output, "output", "", "new snapshot directory")
+	}
+	if needsSelection(command) {
+		f.BoolVar(&all, "all", false, "select every session")
 		f.Var(&ids, "session", "select session (repeatable)")
-		if command == "sync" {
-			f.IntVar(&batchRows, "batch-rows", 500, "maximum rows per batch")
-			f.IntVar(&batchBytes, "batch-bytes", 4<<20, "maximum uncompressed bytes per batch")
-			f.Float64Var(&delay, "delay", 2, "seconds after each batch")
-		}
-	case "status", "verify-local", "ping", "init":
-	default:
-		return fault.New("unknown command")
+	}
+	if command == "sync" {
+		f.IntVar(&batchRows, "batch-rows", defaultBatchRows, "maximum events per batch")
+		f.IntVar(&batchBytes, "batch-bytes", defaultBatchBytes, "maximum uncompressed bytes per batch")
+		f.Float64Var(&delay, "delay", defaultDelaySeconds, "seconds after each successful batch")
 	}
 	if e := f.Parse(rest[1:]); e != nil {
 		if errors.Is(e, flag.ErrHelp) {
-			return nil
+			return help(out, command)
 		}
-		return e
+		return parseError(e, command)
 	}
 	if f.NArg() != 0 {
-		return fault.New("unexpected positional arguments")
+		return usage("unexpected positional argument; this command uses named options", hint)
+	}
+	p := &presenter{out: out, progress: stderr, json: jsonMode, command: command, output: output}
+	emit := p.emit
+	if version || command == "version" {
+		return emit(map[string]any{"version": Version})
+	}
+	// Validate the complete request before opening files or making network calls.
+	if needsSnapshot(command) && db == "" {
+		example := "agent-archive " + command + " --snapshot ./codex-backup"
+		if needsCloud(command) {
+			example += " --config ./connection.local.json"
+		}
+		example += selectionExample(command)
+		return usage("--snapshot is required", "Example: "+example+"\n"+hint)
+	}
+	if needsCloud(command) && config == "" {
+		return usage("--config is required", "Pass a private connection JSON file. See 'agent-archive help "+command+"'.")
+	}
+	if needsSelection(command) && (all == (len(ids) > 0)) {
+		return usage("choose either --all or one or more --session ID options", hint)
+	}
+	if db != "" && !needsSnapshot(command) {
+		return usage("--snapshot does not apply to this command", hint)
+	}
+	if config != "" && !needsCloud(command) {
+		return usage("--config does not apply to this command", hint)
+	}
+	if command == "sync" && (batchRows <= 0 || batchBytes <= 0 || math.IsNaN(delay) || math.IsInf(delay, 0) || delay < 0 || delay > 86400) {
+		return usage("batch limits must be positive; --delay must be between 0 and 86400 seconds", hint)
 	}
 	if command == "collect" {
 		if source != "codex" && source != "claude-code" && source != "claude_code" {
-			return fault.New("choose --source codex or claude-code")
+			return usage("--source must be codex or claude-code", hint)
 		}
 		if output == "" {
-			return fault.New("--output is required")
+			return usage("--output is required and must name a new directory", hint)
 		}
 		if home == "" {
 			user, e := os.UserHomeDir()
@@ -113,10 +169,7 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) (err error) 
 		return emit(result)
 	}
 	if command == "ping" || command == "init" {
-		if config == "" {
-			return fault.New("--config is required")
-		}
-		client, e := cloud.Load(config)
+		client, e := loadClient(config)
 		if e != nil {
 			return e
 		}
@@ -131,10 +184,18 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) (err error) 
 		}
 		return emit(map[string]any{"success": true, "command": command, "elapsed_seconds": time.Since(start).Seconds()})
 	}
-	if db == "" {
-		return fault.New("--local-db is required")
+	path := db
+	info, e := os.Stat(path)
+	if e != nil {
+		return fault.New("snapshot path cannot be read; pass an existing snapshot directory or database")
 	}
-	store, e := history.Open(db)
+	if info.IsDir() {
+		path = filepath.Join(path, "cleaned.sqlite")
+		if _, e = os.Stat(path); e != nil {
+			return fault.New("snapshot directory has no readable cleaned.sqlite; choose a completed collection")
+		}
+	}
+	store, e := history.Open(path)
 	if e != nil {
 		return e
 	}
@@ -164,13 +225,7 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) (err error) 
 		}
 		return emit(result)
 	}
-	if config == "" {
-		return fault.New("--config is required")
-	}
-	if delay < 0 || delay > 86400 {
-		return fault.New("delay must be between zero and 86400 seconds")
-	}
-	client, e := cloud.Load(config)
+	client, e := loadClient(config)
 	if e != nil {
 		return e
 	}
@@ -179,4 +234,70 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) (err error) 
 		return e
 	}
 	return emit(result)
+}
+func selectionExample(command string) string {
+	if needsSelection(command) {
+		return " --all"
+	}
+	return ""
+}
+func parseError(err error, command string) error {
+	hint := "Run 'agent-archive help' for usage."
+	if command != "" {
+		hint = "Run 'agent-archive help " + command + "' for usage and examples."
+	}
+	text := err.Error()
+	message := "invalid option or option value"
+	for prefix, word := range map[string]string{"flag provided but not defined: ": "unknown option ", "flag needs an argument: ": "missing value for "} {
+		if strings.HasPrefix(text, prefix) {
+			name := strings.TrimLeft(strings.TrimPrefix(text, prefix), "-")
+			if safeFlag(name) {
+				message = word + "--" + name
+			}
+		}
+	}
+	if i := strings.Index(text, " for flag -"); i >= 0 {
+		name := strings.SplitN(text[i+11:], ":", 2)[0]
+		if safeFlag(name) {
+			message = "invalid value for --" + name
+		}
+	}
+	return usage(message, hint)
+}
+func safeFlag(s string) bool {
+	if len(s) == 0 || len(s) > 40 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+func distance(a, b string) int {
+	prev := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		row := make([]int, len(b)+1)
+		row[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
+			}
+			row[j] = min(row[j-1]+1, prev[j]+1, prev[j-1]+cost)
+		}
+		prev = row
+	}
+	return prev[len(b)]
+}
+
+func loadClient(path string) (*cloud.Client, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fault.New("connection config cannot be read; copy connection.example.json to a private file and pass --config")
+	}
+	return cloud.Load(path)
 }

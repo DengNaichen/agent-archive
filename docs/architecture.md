@@ -7,7 +7,10 @@ and optionally synchronizes selected session streams to the user's ClickHouse.
 It preserves evidence rather than computing work-habit metrics.
 
 `cmd/agent-archive` owns process signals, exit status and the single error-reporting
-boundary. `internal/app` owns command arguments, selection and progress output.
+boundary. `internal/app` owns command arguments, selection and presentation. Its help and
+output modules keep the human interface separate from command execution; `--json`
+preserves a machine-readable NDJSON stream. Shared flags work on either side of
+the command, and snapshot directories hide the internal database filename.
 Neither interprets transcript fields or implements SQL/HTTP protocols.
 
 `internal/history` is a deep module with `Collect`, `Open`, `Store.Walk` and
