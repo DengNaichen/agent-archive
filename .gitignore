@@ -1,0 +1,11 @@
+/bin/
+/dist/
+/data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.local.json
+.env
+.env.*
+!.env.example
+.DS_Store
