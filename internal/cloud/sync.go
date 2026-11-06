@@ -22,6 +22,9 @@ type SyncOptions struct {
 	BatchBytes, BatchRows int
 	Delay                 time.Duration
 	Progress              history.Progress
+	Retries               int
+	RetryDelay            time.Duration
+	StateDir, Destination string
 }
 type SyncResult struct {
 	Success        bool   `json:"success"`
@@ -37,7 +40,7 @@ type remoteHash struct {
 	Actual string `json:"actual_sha256"`
 }
 
-func Synchronize(ctx context.Context, store *history.Store, t Transport, ids []string, o SyncOptions) (result SyncResult, err error) {
+func synchronizeOnce(ctx context.Context, store *history.Store, t Transport, ids []string, o SyncOptions) (result SyncResult, err error) {
 	result.Source = store.Source()
 	if e := store.EnsureComplete(ctx); e != nil {
 		return result, e

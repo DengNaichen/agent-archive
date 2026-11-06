@@ -26,6 +26,12 @@ Its `Transport` interface is the actual test seam: production HTTP and a
 fault-injecting test transport. No general repository, service or dependency
 injection framework is needed.
 
+`internal/job` owns a resumable six-stage collect/sync/verify cycle. It composes
+history and cloud through their existing interfaces; it does not parse logs or
+implement transport. `internal/runstate` owns atomic private JSON records and
+SQLite OS locks shared by collectors and cloud tasks. Locks are released on
+process death; no stale PID file must be manually deleted.
+
 `internal/fault` marks messages explicitly safe to show. Internal wrapped parser,
 filesystem and SQL errors stay private. Progress contains metadata/counts only.
 
@@ -52,7 +58,7 @@ Codex copies retain original compression. Claude copies are gzip-compressed;
 its prompt history index is backed up separately and is not counted as events.
 Each transcript file is imported in one SQLite transaction. Failure retains a
 partial output for investigation, with no successful verification report.
-Recollection uses a new directory. A completion marker blocks cloud operations
+Recollection normally uses a new directory; `--incremental` resumes a reusable Go store. A completion marker blocks cloud operations
 on interrupted Go collections; `status` remains available for diagnosis, while
 `verify-local` reports the incomplete marker as a failure.
 
@@ -61,6 +67,40 @@ fields inside supported JSON envelopes are preserved in raw records. Records ove
 64 MiB or decompression errors stop collection explicitly. No authentication
 settings, telemetry, file-history backup bytes or external attachment downloads
 are included. Embedded images/thinking/tool content remain in raw JSON.
+
+## Incremental evidence stores and jobs
+
+`collect --incremental` uses a new snapshot initially. Later invocations bind it
+to the same resolved source home and source type. Content fingerprints, rather
+than mtimes, decide whether files changed. Unchanged files are read for hashing
+but not copied/parsed. Changed/new files are captured in unique directories and
+replayed whole, so Codex context and Claude parent-chain inference remain local
+to their adapters; no byte-offset cursor can lose parser context or partial lines.
+
+The optional v1 `incremental_version=1` extension adds `archive_versions`, keyed
+by original path and content hash. `source_files` tracks the newest capture;
+all earlier original bytes remain verified through `archive_versions`. Event
+identity stays unchanged and events are cumulative: truncation, rewriting,
+rotation or deletion at the source never deletes prior events. Every distinct
+file version retains its provenance. Reverting to an already imported version
+does not duplicate source occurrences. Cloud uploads still only insert missing
+events; extra historical source locations for an already uploaded event are not
+backfilled into that row. Cloud verification covers event IDs and raw content.
+
+Each file import and manifest update commits together. The completion marker is
+cleared before updates, and restored only after full evidence verification.
+Cancellation/failure leaves a resumable incomplete store. Resuming skips committed
+unchanged files, imports remaining changes, then verifies all retained versions
+and events. Full local verification is intentionally retained. Archives from an
+aborted capture may remain unreferenced; there is no automatic garbage collection.
+The database, archives and task JSON must remain private and outside source homes.
+The snapshot lock serializes collectors and synchronizers over the same store.
+
+`run --state DIR` persists a cycle, next stage, safe error and result counts in
+`job.json`. Source homes and destination bind the job. Interrupted cycles resume
+without recollecting newer data halfway through. A completed cycle's next run
+starts incremental collection and a new independent verification scope. `status --state` probes the existing local task lock and reports abandoned
+running state as interrupted. Raw JSON alone records the last persisted phase.
 
 ## Identity and compatibility
 
@@ -112,9 +152,19 @@ Each gzip batch is bounded by row count and uncompressed bytes; oversized events
 are refused whole. After upload, verify all selected event IDs, stored hashes and
 server-computed SHA256(record_json), not just counts or acknowledged inserts.
 
-A timeout after server commit is ambiguous: return failure, then rerun. The next
-run checks remote data and only sends missing IDs. There are no blind retries or
-local checkpoint files pretending the server committed. ReplacingMergeTree and
+A timeout after server commit is ambiguous. Retry the whole session only for
+classified temporary transport / 408 / 429 / 5xx errors, with a bounded cancellable
+delay, and read actual remote hashes again before sending missing IDs. Other
+failures return immediately. There are no blind INSERT retries.
+
+Optional `--state` checkpoints record only fully verified sessions, bound to the
+whole snapshot database SHA256, destination identity (host/port/database/user,
+never password), ordered selection and upload/verify mode. Atomic JSON replace
+occurs under an OS lock. Unknown/corrupt state is refused; changed scope resets
+checkpoints. Resume trusts verified sessions from that same immutable scope, so
+use fresh state for an independent recheck. `run` uses a new verification scope
+each cycle. Process crashes after commit but before checkpoint cause a safe
+server recheck on resume. ReplacingMergeTree and
 FINAL provide logical deduplication, not uniqueness constraints. Run one uploader
 at a time. Errors may leave earlier batches/sessions uploaded; nothing is deleted.
 

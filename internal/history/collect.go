@@ -23,11 +23,13 @@ import (
 type Progress func(any) error
 type CollectOptions struct {
 	Source, Home, Output string
+	Incremental          bool
 	Progress             Progress
 }
 type CollectReport struct {
 	Source      string `json:"source"`
 	Files       int    `json:"files"`
+	Skipped     int    `json:"skipped_files"`
 	Occurrences int    `json:"occurrences"`
 	Issues      int    `json:"issues"`
 	Changed     int    `json:"changed_files"`
@@ -73,6 +75,9 @@ func resolvedPath(path string) (string, error) {
 	}
 }
 func Collect(ctx context.Context, o CollectOptions) (report CollectReport, err error) {
+	if o.Incremental {
+		return collectIncremental(ctx, o)
+	}
 	if o.Source == "claude-code" {
 		o.Source = "claude_code"
 	}
@@ -148,7 +153,7 @@ func Collect(ctx context.Context, o CollectOptions) (report CollectReport, err e
 	if _, e = db.ExecContext(ctx, schema); e != nil {
 		return report, fmt.Errorf("create snapshot schema: %w", e)
 	}
-	if _, e = db.ExecContext(ctx, "INSERT INTO metadata VALUES('source',?),('schema_version','1'),('collection_complete','false')", o.Source); e != nil {
+	if _, e = db.ExecContext(ctx, "INSERT INTO metadata VALUES('source',?),('schema_version','1'),('collection_complete','false'),('incremental_home',?)", o.Source, home); e != nil {
 		return report, fmt.Errorf("write metadata: %w", e)
 	}
 	report.Source = o.Source

@@ -197,3 +197,45 @@ func TestOperationalErrorsAndCancellation(t *testing.T) {
 		t.Fatal(stderr.String())
 	}
 }
+
+func TestIncrementalAndRunHelpAndLocalTaskStatus(t *testing.T) {
+	for _, command := range []string{"collect", "run", "sync", "verify", "status"} {
+		var out, errout bytes.Buffer
+		if e := Run(context.Background(), []string{command, "--help"}, &out, &errout); e != nil || errout.Len() != 0 {
+			t.Fatal(command, e, errout.String())
+		}
+		want := "--state"
+		if command == "collect" {
+			want = "--incremental"
+		}
+		if !strings.Contains(out.String(), want) {
+			t.Fatal(command, out.String())
+		}
+	}
+	dir := t.TempDir()
+	if e := os.WriteFile(filepath.Join(dir, "job.json"), []byte(`{"version":1,"status":"interrupted","phase":"sync-codex","updated_at":"2026-11-01T00:00:00Z","results":{}}`), 0600); e != nil {
+		t.Fatal(e)
+	}
+	var out, errout bytes.Buffer
+	if e := Run(context.Background(), []string{"status", "--state", dir}, &out, &errout); e != nil {
+		t.Fatal(e)
+	}
+	if !strings.Contains(out.String(), "Task status: interrupted") || !strings.Contains(out.String(), "sync-codex") {
+		t.Fatal(out.String())
+	}
+	out.Reset()
+	if e := Run(context.Background(), []string{"status", "--state", dir, "--json"}, &out, &errout); e != nil || !strings.Contains(out.String(), `"task"`) {
+		t.Fatal(out.String(), e)
+	}
+}
+
+func TestStatusReportsAbandonedRunningTaskAsInterrupted(t *testing.T) {
+	dir := t.TempDir()
+	if e := os.WriteFile(filepath.Join(dir, "job.json"), []byte(`{"version":1,"status":"running","phase":"sync-codex","results":{}}`), 0600); e != nil {
+		t.Fatal(e)
+	}
+	var out, errout bytes.Buffer
+	if e := Run(context.Background(), []string{"status", "--state", dir}, &out, &errout); e != nil || !strings.Contains(out.String(), "Task status: interrupted") {
+		t.Fatal(out.String(), e)
+	}
+}

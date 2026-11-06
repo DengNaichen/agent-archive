@@ -52,7 +52,7 @@ func WriteError(w io.Writer, err error) int {
 		message = "interrupted"
 		hint = "Completed uploads remain stored. Rerun the same sync command to resume."
 		if command != nil && command.command == "collect" {
-			hint = "Partial output is retained. Collect again into a new directory."
+			hint = "Partial output is retained. With --incremental, rerun the same command; otherwise collect into a new directory."
 		}
 	}
 	if jsonMode {
@@ -88,7 +88,7 @@ func (p *presenter) emit(v any) error {
 	}
 	switch r := v.(type) {
 	case history.CollectReport:
-		_, e := fmt.Fprintf(p.out, "Snapshot collected and verified.\n\n  Source:       %s\n  Files:        %s\n  Occurrences:  %s\n  Source issues: %s\n  Changed files: %s\n  Snapshot:     %s\n\nNext: agent-archive status --snapshot %s\n", sourceName(r.Source), count(r.Files), count(r.Occurrences), count(r.Issues), count(r.Changed), strconv.Quote(p.output), shellQuote(p.output))
+		_, e := fmt.Fprintf(p.out, "Snapshot collected and verified.\n\n  Source:       %s\n  Files:        %s\n  Skipped files: %s\n  Occurrences:  %s\n  Source issues: %s\n  Changed files: %s\n  Snapshot:     %s\n\nNext: agent-archive status --snapshot %s\n", sourceName(r.Source), count(r.Files), count(r.Skipped), count(r.Occurrences), count(r.Issues), count(r.Changed), strconv.Quote(p.output), shellQuote(p.output))
 		return e
 	case history.Stats:
 		_, e := fmt.Fprintf(p.out, "Local snapshot\n\n  Source:    %s\n  Sessions:  %s\n  Events:    %s\n  Turns:     %s\n  Database:  %s\n", sourceName(r.Source), count(r.Sessions), count(r.Events), count(r.Turns), size(r.SnapshotBytes))
@@ -127,7 +127,19 @@ func (p *presenter) emit(v any) error {
 		_, e := fmt.Fprintf(p.out, "%s\n\n  Source:          %s\n  Sessions:        %s\n  Verified events: %s\n  Uploaded now:    %s\n  Already present: %s\n", title, sourceName(r.Source), count(r.Sessions), count(r.Verified), count(r.Inserted), count(r.AlreadyPresent))
 		return e
 	case map[string]any:
+		if task, ok := r["task"]; ok {
+			return p.task(task)
+		}
 		switch r["event"] {
+		case "job_stage":
+			_, e := fmt.Fprintf(p.progress, "Stage %v/%v: %v\n", r["stage"], r["total_stages"], r["phase"])
+			return e
+		case "retry_wait":
+			_, e := fmt.Fprintf(p.progress, "Temporary connection error; retrying after %v seconds (attempt %v).\n", r["retry_in_seconds"], r["attempt"])
+			return e
+		case "session_resumed":
+			_, e := fmt.Fprintf(p.progress, "Resumed verified sessions: %v/%v\n", r["completed_sessions"], r["total_sessions"])
+			return e
 		case "collection_progress":
 			_, e := fmt.Fprintf(p.progress, "Collecting files: %v/%v (%v occurrences)\n", r["files"], r["total_files"], r["occurrences"])
 			return e
@@ -190,3 +202,51 @@ func size(n int64) string {
 	return ""
 }
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
+
+func (p *presenter) task(value any) error {
+	b, e := json.Marshal(value)
+	if e != nil {
+		return e
+	}
+	var v struct {
+		Status    string                      `json:"status"`
+		Phase     string                      `json:"phase"`
+		Session   string                      `json:"current_session"`
+		Updated   string                      `json:"updated_at"`
+		Error     string                      `json:"error"`
+		Attempt   int                         `json:"attempt"`
+		Completed map[string]cloud.SyncResult `json:"completed"`
+		Results   map[string]cloud.SyncResult `json:"results"`
+	}
+	if e = json.Unmarshal(b, &v); e != nil {
+		return e
+	}
+	if _, e = fmt.Fprintf(p.out, "Task status: %s\n  Updated: %s\n", v.Status, v.Updated); e != nil {
+		return e
+	}
+	if v.Phase != "" {
+		if _, e = fmt.Fprintf(p.out, "  Phase: %s\n", v.Phase); e != nil {
+			return e
+		}
+	}
+	if v.Session != "" {
+		if _, e = fmt.Fprintf(p.out, "  Current session: %s\n  Attempt: %d\n  Verified sessions: %d\n", v.Session, v.Attempt, len(v.Completed)); e != nil {
+			return e
+		}
+	}
+	keys := []string{}
+	for k := range v.Results {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		r := v.Results[k]
+		if _, e = fmt.Fprintf(p.out, "  %s: %s sessions, %s verified events, %s acknowledged uploads\n", k, count(r.Sessions), count(r.Verified), count(r.Inserted)); e != nil {
+			return e
+		}
+	}
+	if v.Error != "" {
+		_, e = fmt.Fprintf(p.out, "  Error: %s\n", v.Error)
+	}
+	return e
+}

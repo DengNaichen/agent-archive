@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/DengNaichen/agent-archive/internal/fault"
+	"github.com/DengNaichen/agent-archive/internal/history"
 	"io"
 	"net"
 	"net/http"
@@ -101,15 +102,22 @@ func (c *Client) Request(ctx context.Context, sql string, data []byte, compress 
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fault.New("clickhouse connection failed (details withheld)")
+		return nil, transient("clickhouse connection failed (details withheld)")
 	}
 	defer func() { err = errors.Join(err, res.Body.Close()) }()
 	if res.StatusCode != http.StatusOK {
-		return nil, fault.New(fmt.Sprintf("clickhouse http status %d (response withheld)", res.StatusCode))
+		message := fmt.Sprintf("clickhouse http status %d (response withheld)", res.StatusCode)
+		if res.StatusCode == 408 || res.StatusCode == 429 || res.StatusCode >= 500 {
+			return nil, transient(message)
+		}
+		return nil, fault.New(message)
 	}
 	raw, e := io.ReadAll(io.LimitReader(res.Body, 128<<20+1))
 	if e != nil {
-		return nil, fault.New("read clickhouse response (details withheld)")
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, transient("read clickhouse response (details withheld)")
 	}
 	if len(raw) > 128<<20 {
 		return nil, fault.New("clickhouse response exceeds 128 MiB")
@@ -168,3 +176,13 @@ func Scope(source, sid string) string {
 }
 
 var ErrConflict = fault.New("remote snapshot conflicts with local data; no overwrite attempted")
+
+// Destination binds resumable state to the target, without credentials.
+func (c *Client) Destination() string {
+	return history.SHA([]byte(c.endpoint + "\x00" + c.config.Database + "\x00" + c.config.Username))
+}
+
+type temporaryError struct{ error }
+
+func transient(s string) error { return &temporaryError{fault.New(s)} }
+func Retryable(err error) bool { var e *temporaryError; return errors.As(err, &e) }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/DengNaichen/agent-archive/internal/fault"
+	"github.com/DengNaichen/agent-archive/internal/runstate"
 	_ "modernc.org/sqlite"
 	"net/url"
 	"os"
@@ -88,6 +89,16 @@ func Open(path string) (_ *Store, err error) {
 		}
 		if e == nil && version != "1" {
 			return nil, fault.New("unsupported snapshot schema version")
+		}
+	}
+	if hasVersion > 0 {
+		var incremental string
+		e := db.QueryRow("SELECT value FROM metadata WHERE key='incremental_version'").Scan(&incremental)
+		if e != nil && !errors.Is(e, sql.ErrNoRows) {
+			return nil, e
+		}
+		if e == nil && incremental != "1" {
+			return nil, fault.New("unsupported incremental snapshot version")
 		}
 	}
 	s.legacyCodex = exists == 0
@@ -277,4 +288,12 @@ func (s *Store) Plan(ctx context.Context, ids []string) (Plan, error) {
 		result.Bytes += size
 	}
 	return result, nil
+}
+
+// ContentDigest invalidates checkpoints on any durable database change.
+func (s *Store) ContentDigest(ctx context.Context) (string, error) { return fileHash(ctx, s.path) }
+
+// Lock prevents a collector from changing evidence while a sync reads it.
+func (s *Store) Lock(ctx context.Context) (*sql.DB, error) {
+	return runstate.Lock(ctx, filepath.Dir(s.path)+".lock.sqlite")
 }

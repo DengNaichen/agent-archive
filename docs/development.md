@@ -40,3 +40,12 @@ Architecture documentation references InfHarness's Go profile and shared
 foundation: actual package owners, repository-owned validation commands, private
 credentials, preserved existing choices and separation of tests from live side
 effects. The project does not claim a Harness bootstrap or score.
+
+Incremental/task changes must cover unchanged-file skipping, append/rewrite/revert,
+compressed streams, deleted sources, interrupted imports, retained-archive
+corruption, changed source-home rejection, and exclusive lock release. Cloud
+fault tests cover classified retries after ambiguous commits, bounded retry
+budgets, cancellation during backoff, persisted resume and fresh independent
+verification against corrupted server content. Job tests run two sources through
+failure/restart and multiple cycles using the real collector/store/synchronizer
+and a synthetic transport; all real network checks remain explicit and private.

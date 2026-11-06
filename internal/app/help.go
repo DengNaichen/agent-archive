@@ -8,12 +8,16 @@ import (
 type commandHelp struct{ name, summary, usage, details, options, examples string }
 
 var commands = []commandHelp{
+	{"run", "Incrementally collect both sources, sync and independently verify", "run --state <directory> --config <file> [options]",
+		"WRITES private local evidence and missing ClickHouse events. Runs once, with no daemon.\nRerun after interruption to finish the pending cycle. After completion the next\nrun starts a new incremental cycle. Snapshot directories must be outside both source homes.\nOld source versions remain available even when the originals are removed.",
+		"  --state DIR         Required. Private snapshots, task status and checkpoints\n  --codex-home DIR    Override Codex home (default: CODEX_HOME or ~/.codex)\n  --claude-home DIR   Override Claude Code home (default: ~/.claude)\n  --batch-rows N      Maximum upload rows (default: 500)\n  --batch-bytes N     Maximum uncompressed batch bytes (default: 4194304)\n  --delay SECONDS     Pause between upload batches (default: 2)",
+		"  agent-archive run --state ./archive-state --config ./connection.local.json\n  agent-archive status --state ./archive-state"},
 	{"collect", "Create and verify a private snapshot of local agent history", "collect --source <codex|claude-code> --output <new-directory> [options]",
-		"Copies source logs, preserves complete event JSON and source locations, then\nchecks the snapshot. Original logs stay unchanged. Does not contact ClickHouse.\nThe output directory must not exist and must be outside the source home.",
-		"  --source NAME       Required. codex or claude-code\n  --output DIR        Required. New private snapshot directory\n  --home DIR          Override source home (default: CODEX_HOME or ~/.codex for\n                      Codex; ~/.claude for Claude Code)",
+		"Copies source logs, preserves complete event JSON and source locations, then\nchecks the snapshot. Original logs stay unchanged. Does not contact ClickHouse.\nUse a new output directory, or --incremental to update a Go snapshot.\nUnchanged files are fingerprinted but not copied or parsed; changed files are\nreplayed whole. Prior events and original versions are retained.\nOutput must be outside the source home.",
+		"  --incremental       Reuse output; import only new or changed files\n  --source NAME       Required. codex or claude-code\n  --output DIR        Required. Private snapshot directory\n  --home DIR          Override source home (default: CODEX_HOME or ~/.codex for\n                      Codex; ~/.claude for Claude Code)",
 		"  agent-archive collect --source codex --output ./codex-backup\n  agent-archive collect --source claude-code --output ./claude-backup"},
-	{"status", "Show the source, session count and size of a local snapshot", "status --snapshot <directory-or-database> [options]",
-		"Reads a local snapshot. Does not check all hashes or contact ClickHouse.\nUse verify-local to check snapshot integrity.", "",
+	{"status", "Show the source, session count and size of a local snapshot", "status (--snapshot <path> | --state <directory>) [options]",
+		"Reads a local snapshot or persistent task status. Does not contact ClickHouse.\nUse verify-local to check snapshot integrity.", "  --snapshot PATH     Snapshot counts and size (choose this or --state)",
 		"  agent-archive status --snapshot ./codex-backup"},
 	{"plan", "Measure selected local events before uploading", "plan --snapshot <path> (--all | --session <id>...) [options]",
 		"Reads local event counts and raw JSON bytes only. Does not contact ClickHouse.\nThis is not a cloud diff or a compressed storage estimate.", "",
@@ -67,6 +71,7 @@ Local commands:
 ClickHouse commands:
   ping           Test the connection (read-only)
   init           Create missing database objects (writes schema)
+  run            Incrementally collect both sources, sync and verify
   sync           Upload missing events and verify them (writes data)
   verify         Compare a snapshot with cloud data (read-only)
 
@@ -112,7 +117,17 @@ Run 'agent-archive help <command>' for required options and examples.`)
 				return e
 			}
 		}
-		if needsSnapshot(name) {
+		if name == "sync" || name == "verify" || name == "run" {
+			if _, e := fmt.Fprintln(w, "  --retries N         Temporary-error retries per session (default: 5; 0 disables)\n  --retry-delay SEC   Pause before retry (default: 2)"); e != nil {
+				return e
+			}
+		}
+		if name == "sync" || name == "verify" || name == "status" {
+			if _, e := fmt.Fprintln(w, "  --state DIR         Private persistent task state; inspect with status --state\n                      Sync resumes verified sessions; use a fresh state directory\n                      for a fresh independent verification pass."); e != nil {
+				return e
+			}
+		}
+		if needsSnapshot(name) && name != "status" {
 			if _, e := fmt.Fprintln(w, "  --snapshot PATH     Required. Snapshot directory or cleaned.sqlite file"); e != nil {
 				return e
 			}
@@ -143,5 +158,7 @@ Run 'agent-archive help <command>' for required options and examples.`)
 func needsSnapshot(c string) bool {
 	return c == "status" || c == "plan" || c == "verify-local" || c == "sync" || c == "verify"
 }
-func needsCloud(c string) bool     { return c == "ping" || c == "init" || c == "sync" || c == "verify" }
+func needsCloud(c string) bool {
+	return c == "run" || c == "ping" || c == "init" || c == "sync" || c == "verify"
+}
 func needsSelection(c string) bool { return c == "plan" || c == "sync" || c == "verify" }

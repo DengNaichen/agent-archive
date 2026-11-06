@@ -48,6 +48,13 @@ func (s *Store) verify(ctx context.Context, progress Progress, collecting bool) 
 		return v, fault.New("foreign key integrity failed")
 	}
 	query := "SELECT snapshot,sha256,bytes FROM source_files"
+	var versions int
+	if e := s.db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE name='archive_versions'").Scan(&versions); e != nil {
+		return v, e
+	}
+	if versions > 0 {
+		query = "SELECT snapshot,sha256,bytes FROM archive_versions"
+	}
 	if s.legacyCodex {
 		query = "SELECT archive_path,sha256,bytes FROM source_archives"
 		var n int
@@ -79,7 +86,12 @@ func (s *Store) verify(ctx context.Context, progress Progress, collecting bool) 
 		return v, e
 	}
 	var count int
-	if e = s.db.QueryRowContext(ctx, "SELECT count(*) FROM source_files").Scan(&count); e != nil {
+	if e = s.db.QueryRowContext(ctx, func() string {
+		if versions > 0 {
+			return "SELECT count(*) FROM archive_versions"
+		}
+		return "SELECT count(*) FROM source_files"
+	}()).Scan(&count); e != nil {
 		return v, e
 	}
 	if len(archives) != count {
@@ -104,7 +116,12 @@ func (s *Store) verify(ctx context.Context, progress Progress, collecting bool) 
 		compressed := s.source == "claude_code"
 		if hasCompression > 0 {
 			var kind string
-			if e = s.db.QueryRowContext(ctx, "SELECT compression FROM source_files WHERE snapshot=?", a.path).Scan(&kind); e != nil {
+			if e = s.db.QueryRowContext(ctx, func() string {
+				if versions > 0 {
+					return "SELECT compression FROM archive_versions WHERE snapshot=?"
+				}
+				return "SELECT compression FROM source_files WHERE snapshot=?"
+			}(), a.path).Scan(&kind); e != nil {
 				return v, e
 			}
 			compressed = kind == "gzip"

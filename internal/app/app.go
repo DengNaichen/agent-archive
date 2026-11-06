@@ -14,12 +14,15 @@ import (
 	"strings"
 	"time"
 
+	"encoding/json"
 	"github.com/DengNaichen/agent-archive/internal/cloud"
 	"github.com/DengNaichen/agent-archive/internal/fault"
 	"github.com/DengNaichen/agent-archive/internal/history"
+	"github.com/DengNaichen/agent-archive/internal/job"
+	"github.com/DengNaichen/agent-archive/internal/runstate"
 )
 
-const Version = "0.2.0-dev"
+const Version = "0.3.0-dev"
 const defaultBatchRows = 500
 const defaultBatchBytes = 4 << 20
 const defaultDelaySeconds = 2.0
@@ -88,9 +91,13 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) (err error) 
 	shared(f)
 	var ids stringsFlag
 	var all bool
-	var source, home, output string
+	var source, home, output, stateDir, codexHome, claudeHome string
+	var incremental bool
+	retries := 5
+	retryDelay := 2.0
 	batchRows, batchBytes, delay := defaultBatchRows, defaultBatchBytes, defaultDelaySeconds
 	if command == "collect" {
+		f.BoolVar(&incremental, "incremental", false, "update an existing private snapshot")
 		f.StringVar(&source, "source", "", "codex or claude-code")
 		f.StringVar(&home, "home", "", "override source home directory")
 		f.StringVar(&output, "output", "", "new snapshot directory")
@@ -99,7 +106,18 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) (err error) 
 		f.BoolVar(&all, "all", false, "select every session")
 		f.Var(&ids, "session", "select session (repeatable)")
 	}
-	if command == "sync" {
+	if command == "sync" || command == "verify" || command == "run" || command == "status" {
+		f.StringVar(&stateDir, "state", "", "task state directory")
+	}
+	if command == "sync" || command == "verify" || command == "run" {
+		f.IntVar(&retries, "retries", 5, "retries per session on temporary connection errors")
+		f.Float64Var(&retryDelay, "retry-delay", 2, "seconds between retries")
+	}
+	if command == "run" {
+		f.StringVar(&codexHome, "codex-home", "", "Codex source home")
+		f.StringVar(&claudeHome, "claude-home", "", "Claude Code source home")
+	}
+	if command == "sync" || command == "run" {
 		f.IntVar(&batchRows, "batch-rows", defaultBatchRows, "maximum events per batch")
 		f.IntVar(&batchBytes, "batch-bytes", defaultBatchBytes, "maximum uncompressed bytes per batch")
 		f.Float64Var(&delay, "delay", defaultDelaySeconds, "seconds after each successful batch")
@@ -119,7 +137,7 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) (err error) 
 		return emit(map[string]any{"version": Version})
 	}
 	// Validate the complete request before opening files or making network calls.
-	if needsSnapshot(command) && db == "" {
+	if needsSnapshot(command) && db == "" && !(command == "status" && stateDir != "") {
 		example := "agent-archive " + command + " --snapshot ./codex-backup"
 		if needsCloud(command) {
 			example += " --config ./connection.local.json"
@@ -139,8 +157,81 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) (err error) 
 	if config != "" && !needsCloud(command) {
 		return usage("--config does not apply to this command", hint)
 	}
-	if command == "sync" && (batchRows <= 0 || batchBytes <= 0 || math.IsNaN(delay) || math.IsInf(delay, 0) || delay < 0 || delay > 86400) {
+	if (command == "sync" || command == "run") && (batchRows <= 0 || batchBytes <= 0 || math.IsNaN(delay) || math.IsInf(delay, 0) || delay < 0 || delay > 86400) {
 		return usage("batch limits must be positive; --delay must be between 0 and 86400 seconds", hint)
+	}
+	if retries < 0 || retries > 100 || math.IsNaN(retryDelay) || math.IsInf(retryDelay, 0) || retryDelay < 0 || retryDelay > 86400 {
+		return usage("--retries must be 0..100 and --retry-delay must be 0..86400 seconds", hint)
+	}
+	if command == "run" && stateDir == "" {
+		return usage("--state is required", hint)
+	}
+	if command == "status" && stateDir != "" {
+		if db != "" {
+			return usage("choose --snapshot or --state", hint)
+		}
+		// Job status and direct sync status are local JSON records, never cloud queries.
+		for _, name := range []string{"job.json", "task.json"} {
+			b, e := os.ReadFile(filepath.Join(stateDir, name))
+			if errors.Is(e, os.ErrNotExist) {
+				continue
+			}
+			if e != nil {
+				return e
+			}
+			var state map[string]any
+			if e = json.Unmarshal(b, &state); e != nil {
+				return fault.New("task state is invalid")
+			}
+			if state["status"] == "running" || state["status"] == "retry_wait" {
+				lockName := "lock.sqlite"
+				if name == "job.json" {
+					lockName = "job-lock.sqlite"
+				}
+				busy, e := runstate.Busy(ctx, filepath.Join(stateDir, lockName))
+				if e != nil {
+					return e
+				}
+				if !busy {
+					state["status"] = "interrupted"
+					state["error"] = "previous process exited; rerun the same command to resume"
+				}
+			}
+			return emit(map[string]any{"task": state})
+		}
+		return fault.New("no task state found in --state directory")
+	}
+	if command == "run" {
+		user, e := os.UserHomeDir()
+		if e != nil {
+			return e
+		}
+		if codexHome == "" {
+			codexHome = os.Getenv("CODEX_HOME")
+			if codexHome == "" {
+				codexHome = filepath.Join(user, ".codex")
+			}
+		}
+		if claudeHome == "" {
+			claudeHome = filepath.Join(user, ".claude")
+		}
+		codexHome, e = filepath.Abs(codexHome)
+		if e != nil {
+			return e
+		}
+		claudeHome, e = filepath.Abs(claudeHome)
+		if e != nil {
+			return e
+		}
+		client, e := loadClient(config)
+		if e != nil {
+			return e
+		}
+		result, e := job.Run(ctx, job.Options{StateDir: stateDir, CodexHome: codexHome, ClaudeHome: claudeHome, Client: client, Sync: cloud.SyncOptions{BatchRows: batchRows, BatchBytes: batchBytes, Delay: time.Duration(delay * float64(time.Second)), Retries: retries, RetryDelay: time.Duration(retryDelay * float64(time.Second))}, Progress: emit})
+		if e != nil {
+			return e
+		}
+		return emit(map[string]any{"task": result})
 	}
 	if command == "collect" {
 		if source != "codex" && source != "claude-code" && source != "claude_code" {
@@ -162,7 +253,7 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) (err error) 
 				}
 			}
 		}
-		result, e := history.Collect(ctx, history.CollectOptions{Source: source, Home: home, Output: output, Progress: emit})
+		result, e := history.Collect(ctx, history.CollectOptions{Source: source, Home: home, Output: output, Incremental: incremental, Progress: emit})
 		if e != nil {
 			return e
 		}
@@ -229,7 +320,22 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) (err error) 
 	if e != nil {
 		return e
 	}
-	result, e := cloud.Synchronize(ctx, store, client, selected, cloud.SyncOptions{Upload: command == "sync", BatchRows: batchRows, BatchBytes: batchBytes, Delay: time.Duration(delay * float64(time.Second)), Progress: emit})
+	if stateDir != "" {
+		snapshotDir := filepath.Dir(path)
+		// Keep progress records outside immutable snapshot evidence.
+		abs, e := filepath.Abs(stateDir)
+		if e != nil {
+			return e
+		}
+		rel, e := filepath.Rel(snapshotDir, abs)
+		if e != nil {
+			return e
+		}
+		if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return usage("--state must be outside the snapshot", hint)
+		}
+	}
+	result, e := cloud.Synchronize(ctx, store, client, selected, cloud.SyncOptions{StateDir: stateDir, Destination: client.Destination(), Retries: retries, RetryDelay: time.Duration(retryDelay * float64(time.Second)), Upload: command == "sync", BatchRows: batchRows, BatchBytes: batchBytes, Delay: time.Duration(delay * float64(time.Second)), Progress: emit})
 	if e != nil {
 		return e
 	}
